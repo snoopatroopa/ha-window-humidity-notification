@@ -688,19 +688,22 @@ actions:
                 target:
                   entity_id: "{{ luefter }}"
                 continue_on_error: true
-          - alias: Push nur bei geschlossenem oder unbekanntem Fenster
+          - alias: Push bei Fenster zu/unbekannt oder bei offenem Fenster, wenn Lüften nichts bringt
             if:
-              - "{{ fenster_status in ['zu', 'unbekannt'] }}"
+              - "{{ fenster_status in ['zu', 'unbekannt'] or lueften_nutzlos }}"
             then:
               - &feuchte_meldung
                 alias: Feuchte-Meldung (mit Cooldown über den Helfer)
                 if:
                   - alias: Nicht pausiert (Cooldown / Später / Ignorieren)
                     condition: template
+                    # pause_toleranz: Sekunden, die eine Pause in der Zukunft liegen
+                    # darf, ohne zu greifen. Standard 5. fenster_auf setzt 86400, dann
+                    # greift nur "Ignorieren", nicht der Cooldown.
                     value_template: >-
                       {{ not helfer_feuchte
                          or (state_attr(helfer_feuchte, 'timestamp') | float(0))
-                            <= as_timestamp(now()) + 5 }}
+                            <= as_timestamp(now()) + (pause_toleranz | default(5)) }}
                 then:
                   - variables:
                       meldung_tag: "{{ tag_feuchte }}"
@@ -712,7 +715,10 @@ actions:
                                        ' g/m³, außen ' ~ (klima.af_aussen | string | replace('.', ',')) ~ ' g/m³)' -%}
                         {%- endif -%}
                         {%- set fz = ' – Fensterstatus unbekannt' if fenster_status == 'unbekannt' else '' -%}
-                        {%- if lueften_nutzlos -%}
+                        {%- if lueften_nutzlos and fenster_status in ['offen', 'gekippt'] -%}
+                          Luftfeuchte im {{ raum_name }} bei {{ fmt_feuchte }} %, Fenster {{ fenster_status }} –{{ ' ' -}}
+                          Lüften bringt aktuell nichts: bitte Fenster schließen und Lüfter/Entfeuchter nutzen{{ af }}.
+                        {%- elif lueften_nutzlos -%}
                           Luftfeuchte im {{ raum_name }} bei {{ fmt_feuchte }} %{{ fz }} – Lüften bringt aktuell nichts, Lüfter/Entfeuchter nutzen{{ af }}.
                         {%- else -%}
                           Luftfeuchte im {{ raum_name }} bei {{ fmt_feuchte }} %{{ fz }} – bitte lüften{{ af }}.
@@ -837,10 +843,20 @@ actions:
           - condition: trigger
             id: fenster_auf
         sequence:
-          - alias: '"Bitte lüften" ist erledigt, also Feuchte-Meldung entfernen'
-            variables:
-              loeschen_tag: "{{ tag_feuchte }}"
-          - *loeschen
+          - alias: Feuchte hoch und Lüften nutzlos → "Fenster schließen", sonst Feuchte-Meldung entfernen
+            if:
+              - "{{ feuchte is number and feuchte > krit | float and lueften_nutzlos }}"
+            then:
+              # Cooldown greift hier nicht (andere Aussage als "bitte lüften"),
+              # "Ignorieren bis Feuchte ok" schon.
+              - variables:
+                  pause_toleranz: 86400
+              - *feuchte_meldung
+            else:
+              - alias: '"Bitte lüften" ist erledigt'
+                variables:
+                  loeschen_tag: "{{ tag_feuchte }}"
+              - *loeschen
           - alias: Thermostat verzögert absenken
             if:
               - "{{ thermostat_an }}"
@@ -1041,7 +1057,7 @@ actions:
                        else 'zu' if s == zu_wert else 'unbekannt' }}
               - if:
                   - "{{ feuchte is number and feuchte > krit | float }}"
-                  - "{{ fenster_status in ['zu', 'unbekannt'] }}"
+                  - "{{ fenster_status in ['zu', 'unbekannt'] or lueften_nutzlos }}"
                 then:
                   - *feuchte_meldung
 

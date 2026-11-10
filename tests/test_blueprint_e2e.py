@@ -354,6 +354,42 @@ async def main():
     hass.states.async_set("sensor.kalt_fenster", "closed"); await wait(2.0)
     check("warm: closed before full limit -> no alert", not msgs("fenster_kalt", clear=False))
 
+    # --- 15. Window open + useless ventilation -> "Fenster schließen"
+    def aussen(t, rh):
+        hass.states.async_set("sensor.aussen_temp", str(t), {"device_class": "temperature", "unit_of_measurement": "°C"})
+        hass.states.async_set("sensor.aussen_feuchte", str(rh), {"device_class": "humidity", "unit_of_measurement": "%"})
+    aussen(24, 90)
+    hass.states.async_set("sensor.bad_og_fenster", "closed")
+    setf("60"); await wait(9)  # cooldown expired
+    hass.states.async_set("sensor.bad_og_fenster", "tilted"); await wait(0.5)
+    sent.clear()
+    setf("70"); await wait(1.6)
+    m = msgs("feuchte_bad_og", clear=False)
+    check("open + useless: 'Fenster schließen' on humidity high", m and "bitte Fenster schließen" in m[0]["message"])
+    print("   text:", m and m[0]["message"])
+    # Closed: 'bringt nichts' + cooldown; opening during cooldown still warns
+    hass.states.async_set("sensor.bad_og_fenster", "closed"); await wait(0.5)
+    sent.clear()
+    hass.states.async_set("sensor.bad_og_fenster", "open"); await wait(0.5)
+    m = msgs("feuchte_bad_og", clear=False)
+    check("opening window while useless warns despite cooldown", m and "bitte Fenster schließen" in m[0]["message"])
+    hass.states.async_set("sensor.bad_og_fenster", "closed"); await wait(0.5)
+    hass.bus.async_fire("mobile_app_notification_action", {"action": "RFL_BAD_OG_FEUCHTE_IGNORIEREN"})
+    await wait(0.5)
+    sent.clear()
+    hass.states.async_set("sensor.bad_og_fenster", "open"); await wait(0.5)
+    check("ignore suppresses 'Fenster schließen' on open", not msgs("feuchte_bad_og", clear=False))
+    hass.states.async_set("sensor.bad_og_fenster", "closed"); await wait(0.5)
+    setf("50"); await wait(2.5)  # feuchte_ok resets ignore
+    aussen(2.0, 80)
+    setf("70"); await wait(1.6)
+    sent.clear()
+    hass.states.async_set("sensor.bad_og_fenster", "open"); await wait(0.5)
+    check("useful ventilation: opening only clears humidity msg",
+          msgs("feuchte_bad_og", clear=True) and not msgs("feuchte_bad_og", clear=False))
+    hass.states.async_set("sensor.bad_og_fenster", "closed"); await wait(0.5)
+    setf("50"); await wait(2.5)
+
     # --- 14. Humidity snooze / ignore
     hass.states.async_set("sensor.bad_og_fenster", "closed")
     setf("60"); await wait(9)  # cooldown expired

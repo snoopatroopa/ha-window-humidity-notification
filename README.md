@@ -35,9 +35,9 @@ Mindestversion: **Home Assistant 2026.7.0**
 
 | Trigger-ID | Auslöser | Was passiert |
 |---|---|---|
-| `feuchte_hoch` | `humidity.crossed_threshold` über *kritisch*, für *Mindestdauer* | Fenster **zu**: Push „bitte lüften“ bzw. „Lüften bringt nichts“. Fenster **unbekannt**: gleiche Meldung mit Zusatz „Fensterstatus unbekannt“. Fenster **offen/gekippt**: kein Push. Lüfter an, wenn Fenster zu oder Lüften nichts bringt. Cooldown setzen. |
+| `feuchte_hoch` | `humidity.crossed_threshold` über *kritisch*, für *Mindestdauer* | Fenster **zu**: Push „bitte lüften“ bzw. „Lüften bringt nichts“. Fenster **unbekannt**: gleiche Meldung mit Zusatz „Fensterstatus unbekannt“. Fenster **offen/gekippt**: kein Push, außer Lüften bringt laut Taupunkt nichts. Dann kommt „Lüften bringt aktuell nichts: bitte Fenster schließen und Lüfter/Entfeuchter nutzen“. Lüfter an, wenn Fenster zu oder Lüften nichts bringt. Cooldown setzen. |
 | `feuchte_ok` | `humidity.crossed_threshold` unter *OK-Wert*, für 2 min | Fenster offen/gekippt: Push „Fenster kann geschlossen werden“. Sonst wird die alte Feuchte-Meldung gelöscht. Lüfter aus. „Ignorieren bis Feuchte ok“ endet. |
-| `fenster_auf` | Fensterzustand wechselt auf offen/gekippt (von etwas anderem) | Feuchte-Meldung löschen, weil gelüftet wird. Optional nach *Verzögerung* Thermostat-Snapshot (`scene.create`) und Absenkung. |
+| `fenster_auf` | Fensterzustand wechselt auf offen/gekippt (von etwas anderem) | Feuchte über *kritisch* und Lüften nutzlos: Push „bitte Fenster schließen“ (der Cooldown greift hier nicht, „Ignorieren bis Feuchte ok“ schon). Sonst wird die Feuchte-Meldung gelöscht, weil gelüftet wird. Optional nach *Verzögerung* Thermostat-Snapshot (`scene.create`) und Absenkung. |
 | `fenster_zu` | Fensterzustand wechselt auf *zu* | Fenster- und Feuchte-Meldungen löschen (`clear_notification` mit gleichem `tag`), Fenster-Pause zurücksetzen, Thermostat wiederherstellen (`scene.turn_on`, danach `scene.delete`). Feuchte noch hoch: Lüfter an. Laufende Erinnerungen enden von selbst. |
 | `fenster_zu_lange_nicht_zu` | Template-Trigger „offen ODER gekippt“ mit `for:` | Meldung mit Dauer, Zustand und Außentemperatur, danach Erinnerungen |
 | `fenster_zu_lange_ganz_offen` | State-Trigger *offen* mit `for:` | wie oben, für den Zustand ganz offen |
@@ -314,8 +314,9 @@ noch als zu.
 - `max_erinnerungen` zählt Durchläufe, auch solche ohne Push (Ruhezeit, Pause, Übernahme durch die
   „ganz offen“-Schleife).
 - Wird das Thermostat bei offenem Fenster von Hand verstellt, überschreibt die Wiederherstellung das.
-- Bei offenem Fenster **und** nutzlosem Lüften kommt laut Vorgabe keine Push-Nachricht. Nur der
-  Lüfter wird eingeschaltet.
+- „Fenster schließen“ wegen nutzlosen Lüftens kommt nur bei zwei Ereignissen: wenn die Feuchte die
+  kritische Schwelle überschreitet oder wenn das Fenster geöffnet wird. Kippt das Außenklima, während
+  das Fenster schon offen ist und die Feuchte schon hoch, kommt keine neue Meldung.
 - Den Raumnamen in eine Form bringen, die zu „im …“ passt (z. B. „Bad OG“, „Wohnzimmer“).
   Ein Umbenennen ändert Tags und Aktions-IDs, Buttons alter Meldungen tun dann nichts mehr.
 - Höchstens 20 parallele Läufe pro Instanz. Das reicht im Normalbetrieb mit großem Abstand.
@@ -325,8 +326,8 @@ noch als zu.
 - `yamllint` (Konfiguration in `.yamllint`) läuft ohne Fehler durch.
 - Der Ende-zu-Ende-Test [`tests/test_blueprint_e2e.py`](tests/test_blueprint_e2e.py) lädt den
   Blueprint in einen echten Home-Assistant-Core (getestet mit 2026.11.1, Schema-Validierung inklusive)
-  und spielt 44 Szenarien mit auf Sekunden verkürzten Dauern durch: Restart-Guard, Cooldown,
+  und spielt 48 Szenarien mit auf Sekunden verkürzten Dauern durch: Restart-Guard, Cooldown,
   Taupunkt, Thermostat-Snapshot und -Wiederherstellung, `tilted`↔`open` ohne Reset, Erinnerungen,
   Abbruch beim Schließen, Snooze/Ignorieren für Fenster und Feuchte, unbekannter Fensterzustand,
-  Hysterese-Absicherung, Kältefaktor, Instanz ohne Helfer.
-  Ergebnis: **44/44 bestanden**, keine Warnungen oder Fehler im HA-Log.
+  Hysterese-Absicherung, Kältefaktor, Instanz ohne Helfer, „Fenster schließen“ bei nutzlosem Lüften.
+  Ergebnis: **48/48 bestanden**, keine Warnungen oder Fehler im HA-Log.
