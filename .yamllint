@@ -1,0 +1,8 @@
+extends: default
+rules:
+  document-start: disable
+  truthy:
+    check-keys: false
+  # Lange Jinja-Zeilen in Meldungstexten sind gewollt
+  line-length:
+    max: 160

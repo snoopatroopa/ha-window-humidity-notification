@@ -1,0 +1,1112 @@
+# =============================================================================
+# Raumfeuchte & Lüftungswächter – Automations-Blueprint für Home Assistant
+# =============================================================================
+#
+# Designentscheidungen (Kurzfassung, Details im README):
+#
+# * mode: parallel
+#   - Ein "fenster_zu" beendet laufende Erinnerungs-Schleifen NICHT durch
+#     Abbruch, sondern weil jede Schleife per `wait_template` auf
+#     "Fenster nicht mehr offen/gekippt" wartet. Das greift auch, wenn das
+#     Fenster schon zu ist, wenn die Wartezeit beginnt.
+#   - "feuchte_ok" läuft in einem eigenen parallelen Lauf und wird nie von
+#     einer wartenden Schleife blockiert (bei `single`/`queued` schon).
+#   - `restart` wäre falsch: Jeder Feuchte-Trigger würde eine laufende
+#     Fenster-Erinnerung oder die Heizungs-Absenkverzögerung abwürgen.
+#
+# * Gesamtdauer "offen ODER gekippt" (fenster_zu_lange_nicht_zu):
+#   Template-Trigger mit `for:`. Ein State-Trigger mit `to: [open, tilted]`
+#   und `for:` ist KEINE Alternative: Der Core (homeassistant/triggers/state.py,
+#   `_check_same_state`) vergleicht den aktuellen Zustand mit genau dem Zustand,
+#   der den Timer gestartet hat. `open` -> `tilted` bricht den Timer also ab.
+#   Die native Alternative wäre ein Template-Binärsensor-Helfer "Fenster nicht
+#   zu" (pro Raum). Der Template-Trigger hält den Blueprint helferfrei.
+#
+# * Feuchte-Trigger: purpose-specific `humidity.crossed_threshold` (seit 2026.4,
+#   mit `options.for` und `behavior: each` ab 2026.7 in dieser Form). Er
+#   verwirft Änderungen, die von `unavailable`/`unknown` kommen, also genau den
+#   Fehlalarm nach einem Neustart. Zusätzlich prüft jede Feuchte-Verzweigung
+#   `trigger.from_state` explizit (doppelte Absicherung, falls jemand den
+#   Trigger später auf `numeric_state` umbaut).
+#
+# * `!input` wird nie in Templates verwendet: Alles läuft über
+#   `trigger_variables:` (eingeschränkte Templates, ohne states()) und
+#   `variables:` (vollständige Templates).
+#
+# * Wiederkehrende Bausteine (Meldung senden, Meldung löschen,
+#   Fenster-Erinnerungsschleife, Feuchte-Meldung) sind per YAML-Anker
+#   (&name / *name) einmal definiert und mehrfach verwendet.
+# =============================================================================
+
+blueprint:
+  name: Raumfeuchte & Lüftungswächter
+  description: >-
+    Überwacht pro Raum die relative Luftfeuchte und den Fensterzustand
+    (offen / gekippt / zu).
+
+
+    **Funktionen**
+
+    - Meldung „bitte lüften“, wenn die Feuchte über dem kritischen Wert
+    liegt und das Fenster zu ist. Bei aktivierter Taupunktprüfung heißt die
+    Meldung stattdessen „Lüften bringt aktuell nichts“, wenn die Außenluft
+    nicht deutlich trockener ist.
+
+    - Meldung „Fenster kann geschlossen werden“, wenn die Feuchte bei offenem
+    oder gekipptem Fenster wieder unter den OK-Wert fällt.
+
+    - Meldung mit Erinnerungen, wenn das Fenster zu lange ganz offen oder
+    insgesamt zu lange nicht zu ist (gekippt und offen zusammengerechnet).
+
+    - Optional: Thermostat absenken bei offenem Fenster, Lüfter schalten.
+
+
+    **Wichtig:** Der OK-Wert muss kleiner als der kritische Wert sein
+    (Hysterese). Sonst bricht die Automation mit einer Fehlermeldung ab.
+
+
+    Unbekannte Fensterzustände (`unavailable`, `unknown` oder ein anderer
+    Wert) gelten weder als offen noch als zu. Dann gibt es nur
+    Feuchte-Meldungen und keine Fenster-Meldungen.
+  domain: automation
+  author: snoopatroopa
+  source_url: https://github.com/<user>/<repo>/blob/main/blueprints/automation/raumfeuchte_lueftung.yaml
+  homeassistant:
+    # humidity.crossed_threshold mit options.for und behavior "each" gibt es
+    # in dieser Form ab 2026.7.
+    min_version: "2026.7.0"
+  input:
+    # -------------------------------------------------------------------------
+    raum_sensoren:
+      name: Raum & Sensoren
+      icon: mdi:home-thermometer
+      input:
+        raum_name:
+          name: Raumname
+          description: >-
+            Erscheint in den Meldungen. Daraus werden auch die Benachrichtigungs-Tags
+            und die Aktions-IDs gebildet (z. B. „Bad OG“ → `feuchte_bad_og`).
+            Jeder Raum braucht deshalb einen eigenen Namen.
+          selector:
+            text:
+        feuchte_sensor:
+          name: Feuchtesensor
+          description: Sensor für die relative Luftfeuchte (Einheit %).
+          selector:
+            entity:
+              filter:
+                - domain: sensor
+                  device_class: humidity
+        temperatur_sensor_innen:
+          name: Temperatursensor innen (optional)
+          description: Wird nur für die Taupunkt- bzw. Absolutfeuchte-Prüfung gebraucht.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: sensor
+                  device_class: temperature
+        fenster_sensor:
+          name: Fenstersensor
+          description: >-
+            Sensor mit den drei Zuständen offen / gekippt / zu
+            (z. B. `sensor.bad_og_fenster`).
+          selector:
+            entity:
+              filter:
+                - domain: sensor
+        fenster_offen_wert:
+          name: Zustandswert „offen“
+          default: open
+          selector:
+            text:
+        fenster_gekippt_wert:
+          name: Zustandswert „gekippt“
+          default: tilted
+          selector:
+            text:
+        fenster_zu_wert:
+          name: Zustandswert „zu“
+          description: >-
+            Nur genau dieser Wert gilt als geschlossen. Alles andere, was weder
+            offen noch gekippt ist, gilt als „unbekannt“.
+          default: closed
+          selector:
+            text:
+
+    # -------------------------------------------------------------------------
+    schwellwerte:
+      name: Schwellwerte
+      icon: mdi:water-percent-alert
+      input:
+        feuchte_kritisch:
+          name: Kritische Luftfeuchte
+          description: Ab diesem Wert (und nach der Mindestdauer) kommt die Meldung „bitte lüften“.
+          default: 65
+          selector:
+            number:
+              min: 30
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+        feuchte_ok:
+          name: Luftfeuchte OK
+          description: >-
+            Unter diesem Wert (für 2 Minuten) gilt die Luft wieder als OK.
+            **Muss kleiner als die kritische Luftfeuchte sein (Hysterese).**
+            Sonst bricht die Automation mit einer Meldung ab.
+          default: 55
+          selector:
+            number:
+              min: 20
+              max: 99
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+        mindestdauer_ueberschreitung:
+          name: Mindestdauer über dem kritischen Wert
+          default:
+            hours: 0
+            minutes: 3
+            seconds: 0
+          selector:
+            duration:
+        max_dauer_nicht_zu:
+          name: Max. Dauer „nicht zu“ (gekippt oder offen)
+          description: >-
+            Gesamtzeit, die das Fenster gekippt ODER offen sein darf. Ein Wechsel
+            gekippt ↔ offen setzt diesen Zähler nicht zurück.
+          default:
+            hours: 0
+            minutes: 45
+            seconds: 0
+          selector:
+            duration:
+        max_dauer_ganz_offen:
+          name: Max. Dauer „ganz offen“
+          default:
+            hours: 0
+            minutes: 15
+            seconds: 0
+          selector:
+            duration:
+        cooldown:
+          name: Cooldown für „Feuchte hoch“
+          description: >-
+            Innerhalb dieser Zeit kommt keine erneute „Feuchte hoch“-Meldung.
+            Wirkt nur mit dem Helfer „Feuchte-Pause“ (Abschnitt Benachrichtigung).
+          default:
+            hours: 0
+            minutes: 30
+            seconds: 0
+          selector:
+            duration:
+
+    # -------------------------------------------------------------------------
+    aussenklima:
+      name: Außenklima & Taupunkt
+      icon: mdi:weather-partly-cloudy
+      collapsed: true
+      input:
+        taupunkt_pruefung_aktiv:
+          name: Taupunktprüfung aktiv
+          description: >-
+            Vergleicht die absolute Feuchte (g/m³, Magnus-Formel) innen und außen.
+            Braucht den Temperatursensor innen sowie Außentemperatur und
+            Außenfeuchte (Sensoren oder Wetter-Entität).
+          default: false
+          selector:
+            boolean:
+        aussen_temperatur:
+          name: Außentemperatur (optional)
+          description: Hat Vorrang vor der Wetter-Entität.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: sensor
+                  device_class: temperature
+        aussen_feuchte:
+          name: Außenfeuchte (optional)
+          description: Hat Vorrang vor der Wetter-Entität.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: sensor
+                  device_class: humidity
+        wetter_entitaet:
+          name: Wetter-Entität (optional)
+          description: Ersatzquelle für Außentemperatur und -feuchte (Attribute `temperature` / `humidity`).
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: weather
+        min_differenz_abs_feuchte:
+          name: Mindestdifferenz der absoluten Feuchte
+          description: >-
+            Um so viel muss die Außenluft trockener sein als die Innenluft, damit
+            Lüften sinnvoll ist.
+          default: 1
+          selector:
+            number:
+              min: 0
+              max: 5
+              step: 0.1
+              unit_of_measurement: g/m³
+              mode: slider
+        dauer_temperaturabhaengig:
+          name: Maximaldauern bei Kälte verkürzen
+          description: >-
+            Liegt die Außentemperatur unter der Kälteschwelle, werden beide
+            Maximaldauern mit dem Kältefaktor multipliziert. Braucht eine
+            Außentemperatur (Sensor oder Wetter-Entität). Die Taupunktprüfung
+            muss dafür nicht aktiv sein.
+          default: false
+          selector:
+            boolean:
+        kalt_schwelle:
+          name: Kälteschwelle
+          default: 5
+          selector:
+            number:
+              min: -20
+              max: 20
+              step: 0.5
+              unit_of_measurement: °C
+              mode: slider
+        kalt_faktor:
+          name: Kältefaktor
+          description: Faktor für beide Maximaldauern bei Kälte (0,5 = halbe Zeit).
+          default: 0.5
+          selector:
+            number:
+              min: 0.1
+              max: 1
+              step: 0.05
+              mode: slider
+
+    # -------------------------------------------------------------------------
+    benachrichtigung:
+      name: Benachrichtigung
+      icon: mdi:cellphone-message
+      input:
+        notify_geraete:
+          name: Mobile Geräte
+          description: Geräte der Companion App, die eine Push-Nachricht bekommen.
+          default: []
+          selector:
+            device:
+              multiple: true
+              filter:
+                - integration: mobile_app
+        zusaetzliche_aktionen:
+          name: Zusätzliche Aktionen (optional)
+          description: >-
+            Laufen bei jeder Meldung zusätzlich (z. B. TTS oder Telegram).
+            Verfügbare Variablen: `meldung_titel`, `meldung_text`, `meldung_tag`,
+            `raum_name`. Ruhezeit und Anwesenheit gelten auch hier.
+          default: []
+          selector:
+            action:
+        erinnerung_intervall:
+          name: Erinnerungsintervall (Fenster)
+          default:
+            hours: 0
+            minutes: 10
+            seconds: 0
+          selector:
+            duration:
+        max_erinnerungen:
+          name: Max. Anzahl Erinnerungen (Fenster)
+          description: Anzahl der Erinnerungen nach der ersten Fenster-Meldung.
+          default: 3
+          selector:
+            number:
+              min: 0
+              max: 20
+              step: 1
+              mode: box
+        ruhezeit_start:
+          name: Ruhezeit Beginn (optional)
+          description: >-
+            In der Ruhezeit gibt es keine Meldungen. Die Meldungen werden auch
+            nicht nachgeholt. Die Ruhezeit darf über Mitternacht gehen (z. B. 22:00–06:30).
+          default: ""
+          selector:
+            time:
+        ruhezeit_ende:
+          name: Ruhezeit Ende (optional)
+          default: ""
+          selector:
+            time:
+        anwesenheit:
+          name: Anwesenheit (optional)
+          description: >-
+            Nur benachrichtigen, wenn jemand zu Hause ist. Person: Zustand
+            `home`. Zone: Anzahl > 0. Gruppe: `home` oder `on`.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain:
+                    - person
+                    - zone
+                    - group
+        helfer_feuchte_pause:
+          name: Helfer „Feuchte-Pause“ (optional, empfohlen)
+          description: >-
+            `input_datetime` mit Datum UND Uhrzeit. Speichert, bis wann
+            „Feuchte hoch“-Meldungen stumm sind. Ohne diesen Helfer gibt es
+            keinen Cooldown und keine Aktions-Buttons an Feuchte-Meldungen.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: input_datetime
+        helfer_fenster_pause:
+          name: Helfer „Fenster-Pause“ (optional, empfohlen)
+          description: >-
+            `input_datetime` mit Datum UND Uhrzeit. Speichert, bis wann
+            Fenster-Meldungen stumm sind (Später erinnern / Ignorieren bis
+            Fenster zu). Ohne diesen Helfer haben Fenster-Meldungen keine
+            Aktions-Buttons.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: input_datetime
+
+    # -------------------------------------------------------------------------
+    optionale_aktionen:
+      name: Optionale Aktionen
+      icon: mdi:fan
+      collapsed: true
+      input:
+        thermostat_aktiv:
+          name: Thermostat bei offenem Fenster absenken
+          default: false
+          selector:
+            boolean:
+        thermostat:
+          name: Thermostat (optional)
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: climate
+        heizung_verzoegerung:
+          name: Verzögerung bis zur Absenkung
+          default:
+            hours: 0
+            minutes: 2
+            seconds: 0
+          selector:
+            duration:
+        absenk_art:
+          name: Art der Absenkung
+          default: temperatur
+          selector:
+            select:
+              options:
+                - label: Auf Absenktemperatur stellen
+                  value: temperatur
+                - label: Ausschalten (climate.turn_off)
+                  value: aus
+        absenk_temperatur:
+          name: Absenktemperatur
+          default: 12
+          selector:
+            number:
+              min: 5
+              max: 20
+              step: 0.5
+              unit_of_measurement: °C
+              mode: slider
+        luefter_aktiv:
+          name: Lüfter/Entfeuchter schalten
+          description: >-
+            Einschalten bei hoher Feuchte und geschlossenem Fenster oder wenn
+            Lüften laut Taupunkt nichts bringt. Ausschalten bei „Feuchte OK“.
+          default: false
+          selector:
+            boolean:
+        luefter:
+          name: Lüfter / Entfeuchter (optional)
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain:
+                    - fan
+                    - switch
+
+# =============================================================================
+mode: parallel
+max: 20
+
+# Eingeschränkte Templates (kein states()): Werte, die schon die Trigger brauchen.
+trigger_variables:
+  raum_name: !input raum_name
+  fenster: !input fenster_sensor
+  offen_wert: !input fenster_offen_wert
+  gekippt_wert: !input fenster_gekippt_wert
+  zu_wert: !input fenster_zu_wert
+  dauer_temp_abh: !input dauer_temperaturabhaengig
+  kalt_faktor: !input kalt_faktor
+  _d_mindest: !input mindestdauer_ueberschreitung
+  _d_nicht_zu: !input max_dauer_nicht_zu
+  _d_ganz_offen: !input max_dauer_ganz_offen
+  _d_cooldown: !input cooldown
+  _d_intervall: !input erinnerung_intervall
+  _d_heizung: !input heizung_verzoegerung
+  # Alle Dauern einmal in Sekunden umrechnen (Duration-Selector liefert ein
+  # Dict; Strings "HH:MM:SS" und Zahlen werden ebenfalls akzeptiert).
+  dauer: >-
+    {%- macro sek(d) -%}
+      {%- if d is mapping -%}
+        {{ (d.get('days', 0) | float(0)) * 86400 + (d.get('hours', 0) | float(0)) * 3600
+           + (d.get('minutes', 0) | float(0)) * 60 + (d.get('seconds', 0) | float(0)) }}
+      {%- elif d is string and ':' in d -%}
+        {%- set p = d.split(':') | map('float', 0) | list -%}
+        {{ p[0] * 3600 + p[1] * 60 + (p[2] if p | count > 2 else 0) }}
+      {%- else -%}
+        {{ d | float(0) }}
+      {%- endif -%}
+    {%- endmacro -%}
+    {{ {
+      'mindest': sek(_d_mindest) | float | int,
+      'nicht_zu': sek(_d_nicht_zu) | float | int,
+      'ganz_offen': sek(_d_ganz_offen) | float | int,
+      'cooldown': sek(_d_cooldown) | float | int,
+      'intervall': [sek(_d_intervall) | float | int, 60] | max,
+      'heizung': sek(_d_heizung) | float | int
+    } }}
+  # Trigger feuern bei der kürzest möglichen Dauer (bei aktivem Kältefaktor
+  # verkürzt). Ob es gerade kalt ist, prüfen die Actions. Ist es nicht kalt,
+  # warten sie die restliche Zeit ab. So steckt kein states() im Trigger.
+  trigger_faktor: "{{ ([kalt_faktor | float(1), 1] | min) if dauer_temp_abh else 1 }}"
+  raum_slug: "{{ raum_name | slugify }}"
+  tag_feuchte: "feuchte_{{ raum_slug }}"
+  tag_fenster: "fenster_{{ raum_slug }}"
+  aktion_feuchte_spaeter: "RFL_{{ raum_slug | upper }}_FEUCHTE_SPAETER"
+  aktion_feuchte_ignorieren: "RFL_{{ raum_slug | upper }}_FEUCHTE_IGNORIEREN"
+  aktion_fenster_spaeter: "RFL_{{ raum_slug | upper }}_FENSTER_SPAETER"
+  aktion_fenster_ignorieren: "RFL_{{ raum_slug | upper }}_FENSTER_IGNORIEREN"
+
+triggers:
+  - trigger: humidity.crossed_threshold
+    id: feuchte_hoch
+    target:
+      entity_id: !input feuchte_sensor
+    options:
+      threshold:
+        type: above
+        value:
+          number: !input feuchte_kritisch
+      for: !input mindestdauer_ueberschreitung
+
+  - trigger: humidity.crossed_threshold
+    id: feuchte_ok
+    target:
+      entity_id: !input feuchte_sensor
+    options:
+      threshold:
+        type: below
+        value:
+          number: !input feuchte_ok
+      for:
+        minutes: 2
+
+  # not_from statt from: zu_wert. So fehlt auch der Wechsel
+  # zu -> unavailable -> offen nicht (z. B. Funk-/Gateway-Aussetzer).
+  - trigger: state
+    id: fenster_auf
+    entity_id: !input fenster_sensor
+    not_from:
+      - !input fenster_offen_wert
+      - !input fenster_gekippt_wert
+    to:
+      - !input fenster_offen_wert
+      - !input fenster_gekippt_wert
+
+  - trigger: state
+    id: fenster_zu
+    entity_id: !input fenster_sensor
+    to: !input fenster_zu_wert
+
+  # Gesamtdauer "offen ODER gekippt". Begründung siehe Kopfkommentar.
+  - trigger: template
+    id: fenster_zu_lange_nicht_zu
+    value_template: "{{ states(fenster) in [offen_wert, gekippt_wert] }}"
+    for:
+      seconds: "{{ (dauer.nicht_zu * trigger_faktor) | int }}"
+
+  - trigger: state
+    id: fenster_zu_lange_ganz_offen
+    entity_id: !input fenster_sensor
+    to: !input fenster_offen_wert
+    for:
+      seconds: "{{ (dauer.ganz_offen * trigger_faktor) | int }}"
+
+  # Antworten auf die Benachrichtigungs-Aktionen (nur IDs dieser Instanz)
+  - trigger: event
+    id: aktion_feuchte_spaeter
+    event_type: mobile_app_notification_action
+    event_data:
+      action: "{{ aktion_feuchte_spaeter }}"
+  - trigger: event
+    id: aktion_feuchte_ignorieren
+    event_type: mobile_app_notification_action
+    event_data:
+      action: "{{ aktion_feuchte_ignorieren }}"
+  - trigger: event
+    id: aktion_fenster_spaeter
+    event_type: mobile_app_notification_action
+    event_data:
+      action: "{{ aktion_fenster_spaeter }}"
+  - trigger: event
+    id: aktion_fenster_ignorieren
+    event_type: mobile_app_notification_action
+    event_data:
+      action: "{{ aktion_fenster_ignorieren }}"
+
+# Vollständige Templates. Die Reihenfolge ist wichtig, weil die Schlüssel
+# nacheinander gerendert werden.
+variables:
+  feuchte_sensor: !input feuchte_sensor
+  temp_innen_sensor: !input temperatur_sensor_innen
+  krit: !input feuchte_kritisch
+  ok_wert: !input feuchte_ok
+  taupunkt_aktiv: !input taupunkt_pruefung_aktiv
+  aussen_temp_sensor: !input aussen_temperatur
+  aussen_feuchte_sensor: !input aussen_feuchte
+  wetter: !input wetter_entitaet
+  min_diff: !input min_differenz_abs_feuchte
+  kalt_schwelle: !input kalt_schwelle
+  notify_geraete: !input notify_geraete
+  max_erinnerungen: !input max_erinnerungen
+  ruhe_start: !input ruhezeit_start
+  ruhe_ende: !input ruhezeit_ende
+  anwesenheit: !input anwesenheit
+  helfer_feuchte: !input helfer_feuchte_pause
+  helfer_fenster: !input helfer_fenster_pause
+  thermostat_aktiv: !input thermostat_aktiv
+  thermostat: !input thermostat
+  absenk_art: !input absenk_art
+  absenk_temperatur: !input absenk_temperatur
+  luefter_aktiv: !input luefter_aktiv
+  luefter: !input luefter
+
+  thermostat_an: "{{ thermostat_aktiv and thermostat | length > 0 }}"
+  luefter_an: "{{ luefter_aktiv and luefter | length > 0 }}"
+  szene_thermostat: "scene.rfl_{{ raum_slug }}_thermostat"
+  # Jeder Zustand wird explizit geprüft. "zu" heißt nie "alles außer offen".
+  fenster_status: >-
+    {%- set s = states(fenster) -%}
+    {{ 'offen' if s == offen_wert else 'gekippt' if s == gekippt_wert
+       else 'zu' if s == zu_wert else 'unbekannt' }}
+  feuchte: "{{ states(feuchte_sensor) | float(none) }}"
+  aussen_t: >-
+    {%- if aussen_temp_sensor -%}{{ states(aussen_temp_sensor) | float(none) }}
+    {%- elif wetter -%}{{ state_attr(wetter, 'temperature') | float(none) }}
+    {%- else -%}{{ none }}{%- endif -%}
+  aussen_rh: >-
+    {%- if aussen_feuchte_sensor -%}{{ states(aussen_feuchte_sensor) | float(none) }}
+    {%- elif wetter -%}{{ state_attr(wetter, 'humidity') | float(none) }}
+    {%- else -%}{{ none }}{%- endif -%}
+  # Absolute Feuchte (g/m³) und Taupunkt (°C) nach Magnus (DIN 4108-3).
+  # Das Macro wird zweimal gebraucht (innen und außen), deshalb ist es hier
+  # einmal definiert.
+  klima: >-
+    {%- macro magnus(t, rh) -%}
+      {%- if t is number and rh is number and rh > 0 -%}
+        {%- set a, b = (7.5, 237.3) if t >= 0 else (7.6, 240.7) -%}
+        {%- set sdd = 6.1078 * 10 ** ((a * t) / (b + t)) -%}
+        {%- set dd = rh / 100 * sdd -%}
+        {%- set v = log(dd / 6.1078, 10) -%}
+        {{ {'af': (216.7 * dd / (t + 273.15)) | round(2), 'td': (b * v / (a - v)) | round(1)} | to_json }}
+      {%- else -%}
+        {{ {'af': none, 'td': none} | to_json }}
+      {%- endif -%}
+    {%- endmacro -%}
+    {%- set ti = states(temp_innen_sensor) | float(none) if temp_innen_sensor else none -%}
+    {%- set i = magnus(ti, feuchte) | from_json -%}
+    {%- set o = magnus(aussen_t, aussen_rh) | from_json -%}
+    {{ {'af_innen': i.af, 'td_innen': i.td, 'af_aussen': o.af, 'td_aussen': o.td} }}
+  taupunkt_daten: "{{ taupunkt_aktiv and klima.af_innen is number and klima.af_aussen is number }}"
+  lueften_nutzlos: "{{ taupunkt_daten and (klima.af_innen - klima.af_aussen) < min_diff | float(1) }}"
+  kalt: "{{ dauer_temp_abh and aussen_t is number and aussen_t < kalt_schwelle | float(5) }}"
+  faktor: "{{ kalt_faktor | float(1) if kalt else 1 }}"
+  grenze_nicht_zu: "{{ (dauer.nicht_zu * faktor) | int }}"
+  grenze_ganz_offen: "{{ (dauer.ganz_offen * faktor) | int }}"
+  fmt_feuchte: "{{ '%.0f' | format(feuchte) if feuchte is number else '?' }}"
+  # Mit Einheit, damit "3,2" nicht als Tupel geparst wird
+  fmt_aussen_t: "{{ ('%.1f' | format(aussen_t)) | replace('.', ',') ~ ' °C' if aussen_t is number else '' }}"
+  # Zeit, bis zu der eine Feuchte-Pause wirkt ("Ignorieren" setzt ein Jahr).
+  ignorieren_sek: 31536000
+
+conditions: []
+
+actions:
+  # ---------------------------------------------------------------------------
+  # Absicherung der Hysterese: OK-Wert muss unter dem kritischen Wert liegen.
+  - alias: Hysterese prüfen (OK-Wert < kritischer Wert)
+    if:
+      - "{{ ok_wert | float >= krit | float }}"
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: "rfl_{{ raum_slug }}_konfiguration"
+          title: "Raumfeuchte & Lüftungswächter: {{ raum_name }}"
+          message: >-
+            Fehlkonfiguration: Der OK-Wert ({{ ok_wert }} %) muss kleiner sein als
+            der kritische Wert ({{ krit }} %). Die Automation tut nichts, bis das
+            behoben ist.
+      - stop: "OK-Wert muss kleiner als der kritische Wert sein"
+        error: true
+
+  - choose:
+      # =======================================================================
+      - alias: Feuchte hoch
+        conditions:
+          - condition: trigger
+            id: feuchte_hoch
+          # Schutz gegen Fehlalarm nach Neustart oder Funkaussetzer
+          - condition: template
+            value_template: >-
+              {{ trigger.from_state is not none
+                 and is_number(trigger.from_state.state) }}
+        sequence:
+          - alias: Lüfter einschalten (Fenster zu oder Lüften bringt nichts)
+            if:
+              - "{{ luefter_an and (fenster_status == 'zu' or lueften_nutzlos) }}"
+            then:
+              - action: homeassistant.turn_on
+                target:
+                  entity_id: "{{ luefter }}"
+                continue_on_error: true
+          - alias: Push nur bei geschlossenem oder unbekanntem Fenster
+            if:
+              - "{{ fenster_status in ['zu', 'unbekannt'] }}"
+            then:
+              - &feuchte_meldung
+                alias: Feuchte-Meldung (mit Cooldown über den Helfer)
+                if:
+                  - alias: Nicht pausiert (Cooldown / Später / Ignorieren)
+                    condition: template
+                    value_template: >-
+                      {{ not helfer_feuchte
+                         or (state_attr(helfer_feuchte, 'timestamp') | float(0))
+                            <= as_timestamp(now()) + 5 }}
+                then:
+                  - variables:
+                      meldung_tag: "{{ tag_feuchte }}"
+                      meldung_titel: "Luftfeuchte {{ raum_name }}"
+                      meldung_text: >-
+                        {%- set af = '' -%}
+                        {%- if taupunkt_daten -%}
+                          {%- set af = ' (abs. Feuchte innen ' ~ (klima.af_innen | string | replace('.', ',')) ~
+                                       ' g/m³, außen ' ~ (klima.af_aussen | string | replace('.', ',')) ~ ' g/m³)' -%}
+                        {%- endif -%}
+                        {%- set fz = ' – Fensterstatus unbekannt' if fenster_status == 'unbekannt' else '' -%}
+                        {%- if lueften_nutzlos -%}
+                          Luftfeuchte im {{ raum_name }} bei {{ fmt_feuchte }} %{{ fz }} – Lüften bringt aktuell nichts, Lüfter/Entfeuchter nutzen{{ af }}.
+                        {%- else -%}
+                          Luftfeuchte im {{ raum_name }} bei {{ fmt_feuchte }} %{{ fz }} – bitte lüften{{ af }}.
+                        {%- endif -%}
+                      meldung_aktionen: >-
+                        {{ [
+                          {'action': aktion_feuchte_spaeter, 'title': 'Später erinnern (30 min)'},
+                          {'action': aktion_feuchte_ignorieren, 'title': 'Ignorieren bis Feuchte ok'}
+                        ] if helfer_feuchte else [] }}
+                  - &senden
+                    alias: Meldung senden (Ruhezeit und Anwesenheit beachten)
+                    if:
+                      - alias: Außerhalb der Ruhezeit und jemand zu Hause
+                        condition: template
+                        # Template statt condition: time, weil beide Zeiten
+                        # optional sind (leere Werte lassen sich dort nicht
+                        # angeben). Über Mitternacht: Start > Ende.
+                        value_template: >-
+                          {%- set n = now().strftime('%H:%M:%S') -%}
+                          {%- set rs = (ruhe_start or '') | string -%}
+                          {%- set re = (ruhe_ende or '') | string -%}
+                          {%- if rs and re and rs != re -%}
+                            {%- set ruhe = (rs <= n < re) if rs < re else (n >= rs or n < re) -%}
+                          {%- else -%}
+                            {%- set ruhe = false -%}
+                          {%- endif -%}
+                          {%- if anwesenheit -%}
+                            {%- set s = states(anwesenheit) -%}
+                            {%- set da = s in ['home', 'on'] or (s | int(0)) > 0 -%}
+                          {%- else -%}
+                            {%- set da = true -%}
+                          {%- endif -%}
+                          {{ (not ruhe) and da }}
+                    then:
+                      - repeat:
+                          for_each: "{{ notify_geraete }}"
+                          sequence:
+                            - action: "notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}"
+                              continue_on_error: true
+                              data:
+                                title: "{{ meldung_titel }}"
+                                message: "{{ meldung_text }}"
+                                data:
+                                  tag: "{{ meldung_tag }}"
+                                  group: "raumfeuchte_{{ raum_slug }}"
+                                  actions: "{{ meldung_aktionen }}"
+                      - choose: []
+                        default: !input zusaetzliche_aktionen
+                  - alias: Cooldown setzen (eine laufende Ignorieren-Pause nicht verkürzen)
+                    if:
+                      - "{{ helfer_feuchte and dauer.cooldown > 0 }}"
+                      - >-
+                        {{ (state_attr(helfer_feuchte, 'timestamp') | float(0))
+                           < as_timestamp(now()) + dauer.cooldown }}
+                    then:
+                      - action: input_datetime.set_datetime
+                        target:
+                          entity_id: "{{ helfer_feuchte }}"
+                        data:
+                          timestamp: "{{ as_timestamp(now()) + dauer.cooldown }}"
+
+      # =======================================================================
+      - alias: Feuchte OK
+        conditions:
+          - condition: trigger
+            id: feuchte_ok
+          - condition: template
+            value_template: >-
+              {{ trigger.from_state is not none
+                 and is_number(trigger.from_state.state) }}
+        sequence:
+          - alias: Lüfter ausschalten
+            if:
+              - "{{ luefter_an }}"
+            then:
+              - action: homeassistant.turn_off
+                target:
+                  entity_id: "{{ luefter }}"
+                continue_on_error: true
+          - alias: Ignorieren-Pause beenden (Cooldown bleibt)
+            if:
+              - "{{ helfer_feuchte | length > 0 }}"
+              - >-
+                {{ (state_attr(helfer_feuchte, 'timestamp') | float(0))
+                   > as_timestamp(now()) + 86400 }}
+            then:
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: "{{ helfer_feuchte }}"
+                data:
+                  timestamp: "{{ as_timestamp(now()) }}"
+          - if:
+              - "{{ fenster_status in ['offen', 'gekippt'] }}"
+            then:
+              - variables:
+                  meldung_tag: "{{ tag_feuchte }}"
+                  meldung_titel: "Luftfeuchte {{ raum_name }}"
+                  meldung_text: >-
+                    Luftfeuchte im {{ raum_name }} wieder bei {{ fmt_feuchte }} % –
+                    Fenster kann geschlossen werden.
+                  meldung_aktionen: []
+              - *senden
+            else:
+              # Fenster zu oder unbekannt: veraltete "bitte lüften"-Meldung entfernen
+              - variables:
+                  loeschen_tag: "{{ tag_feuchte }}"
+              - &loeschen
+                alias: Meldung auf allen Geräten entfernen
+                repeat:
+                  for_each: "{{ notify_geraete }}"
+                  sequence:
+                    - action: "notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}"
+                      continue_on_error: true
+                      data:
+                        message: clear_notification
+                        data:
+                          tag: "{{ loeschen_tag }}"
+
+      # =======================================================================
+      - alias: Fenster geöffnet
+        conditions:
+          - condition: trigger
+            id: fenster_auf
+        sequence:
+          - alias: '"Bitte lüften" ist erledigt, also Feuchte-Meldung entfernen'
+            variables:
+              loeschen_tag: "{{ tag_feuchte }}"
+          - *loeschen
+          - alias: Thermostat verzögert absenken
+            if:
+              - "{{ thermostat_an }}"
+            then:
+              - alias: Warten, ob das Fenster gleich wieder zugeht
+                wait_template: "{{ states(fenster) not in [offen_wert, gekippt_wert] }}"
+                timeout:
+                  seconds: "{{ dauer.heizung }}"
+              - if:
+                  - "{{ not wait.completed }}"
+                  # Keinen bestehenden Snapshot überschreiben (wäre schon der abgesenkte Zustand)
+                  - "{{ state_attr(szene_thermostat, 'entity_id') is none }}"
+                then:
+                  - action: scene.create
+                    data:
+                      scene_id: "rfl_{{ raum_slug }}_thermostat"
+                      snapshot_entities:
+                        - "{{ thermostat }}"
+                  - if:
+                      - "{{ absenk_art == 'aus' }}"
+                    then:
+                      - action: climate.turn_off
+                        target:
+                          entity_id: "{{ thermostat }}"
+                        continue_on_error: true
+                    else:
+                      - action: climate.set_temperature
+                        target:
+                          entity_id: "{{ thermostat }}"
+                        data:
+                          temperature: "{{ absenk_temperatur }}"
+                        continue_on_error: true
+
+      # =======================================================================
+      - alias: Fenster geschlossen
+        conditions:
+          - condition: trigger
+            id: fenster_zu
+        sequence:
+          # Laufende Erinnerungs-Schleifen beenden sich selbst (wait_template
+          # auf "nicht mehr offen/gekippt"). Hier nur noch aufräumen.
+          - variables:
+              loeschen_tag: "{{ tag_fenster }}"
+          - *loeschen
+          - variables:
+              loeschen_tag: "{{ tag_feuchte }}"
+          - *loeschen
+          - alias: Fenster-Pause zurücksetzen
+            if:
+              - "{{ helfer_fenster | length > 0 }}"
+              - "{{ (state_attr(helfer_fenster, 'timestamp') | float(0)) > as_timestamp(now()) }}"
+            then:
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: "{{ helfer_fenster }}"
+                data:
+                  timestamp: "{{ as_timestamp(now()) }}"
+          - alias: Thermostat wiederherstellen
+            if:
+              - "{{ state_attr(szene_thermostat, 'entity_id') is not none }}"
+            then:
+              - action: scene.turn_on
+                target:
+                  entity_id: "{{ szene_thermostat }}"
+                continue_on_error: true
+              - action: scene.delete
+                target:
+                  entity_id: "{{ szene_thermostat }}"
+                continue_on_error: true
+          - alias: Feuchte noch hoch, also Lüfter an (kein Push)
+            if:
+              - "{{ luefter_an and feuchte is number and feuchte > krit | float }}"
+            then:
+              - action: homeassistant.turn_on
+                target:
+                  entity_id: "{{ luefter }}"
+                continue_on_error: true
+
+      # =======================================================================
+      - alias: Fenster zu lange offen / nicht zu
+        conditions:
+          - condition: trigger
+            id:
+              - fenster_zu_lange_nicht_zu
+              - fenster_zu_lange_ganz_offen
+        sequence:
+          - variables:
+              schleife_art: >-
+                {{ 'ganz_offen' if trigger.id == 'fenster_zu_lange_ganz_offen' else 'nicht_zu' }}
+              weiter_zustaende: >-
+                {{ [offen_wert] if schleife_art == 'ganz_offen' else [offen_wert, gekippt_wert] }}
+              grenze: "{{ grenze_ganz_offen if schleife_art == 'ganz_offen' else grenze_nicht_zu }}"
+              vergangen: "{{ trigger.for.total_seconds() | int }}"
+              seit_ts: "{{ as_timestamp(now()) - vergangen }}"
+              seit_genau: true
+          - alias: Ohne Kälte die restliche Zeit bis zur vollen Grenze abwarten
+            if:
+              - "{{ grenze > vergangen }}"
+            then:
+              - wait_template: "{{ states(fenster) not in weiter_zustaende }}"
+                timeout:
+                  seconds: "{{ grenze - vergangen }}"
+              - if:
+                  - "{{ wait.completed }}"
+                then:
+                  - stop: Fenster vor Ablauf der Grenze geschlossen oder Zustand gewechselt
+          - &fenster_schleife
+            alias: Fenster-Meldung und Erinnerungen
+            repeat:
+              sequence:
+                - variables:
+                    jetzt: "{{ as_timestamp(now()) }}"
+                    zustand_jetzt: >-
+                      {{ 'offen' if states(fenster) == offen_wert
+                         else 'gekippt' if states(fenster) == gekippt_wert else 'unbekannt' }}
+                    pausiert: >-
+                      {{ helfer_fenster | length > 0
+                         and (state_attr(helfer_fenster, 'timestamp') | float(0)) > jetzt + 5 }}
+                    # Doppelte Meldungen vermeiden: Ist das Fenster schon länger
+                    # ganz offen als die Grenze, kümmert sich die Schleife
+                    # "ganz_offen" darum.
+                    uebernommen: >-
+                      {{ schleife_art == 'nicht_zu' and zustand_jetzt == 'offen'
+                         and (jetzt - as_timestamp(states[fenster].last_changed)) >= grenze_ganz_offen }}
+                    meldung_tag: "{{ tag_fenster }}"
+                    meldung_titel: "Fenster {{ raum_name }}"
+                    meldung_text: >-
+                      {%- macro dauer_txt(s) -%}
+                        {%- set m = (s / 60) | round(0, 'floor') | int -%}
+                        {{ (m // 60) ~ ' h ' ~ (m % 60) ~ ' min' if m >= 60 else m ~ ' min' }}
+                      {%- endmacro -%}
+                      {%- set z = 'ganz offen' if zustand_jetzt == 'offen' else 'gekippt' -%}
+                      {%- set vor = 'Erinnerung ' ~ (repeat.index - 1) ~ '/' ~ (max_erinnerungen | int) ~ ': ' if repeat.index > 1 else '' -%}
+                      {%- set seit = ('seit ' if seit_genau else 'seit mindestens ') ~ dauer_txt(jetzt - seit_ts) -%}
+                      {%- if schleife_art == 'ganz_offen' -%}
+                        {{ vor }}Fenster im {{ raum_name }} ist {{ seit }} ganz offen (Grenze {{ dauer_txt(grenze_ganz_offen) }}).
+                      {%- else -%}
+                        {{ vor }}Fenster im {{ raum_name }} ist {{ seit }} nicht geschlossen, aktuell {{ z }} (Grenze {{ dauer_txt(grenze_nicht_zu) }}).
+                      {%- endif -%}
+                      {%- if fmt_aussen_t %} Außen {{ fmt_aussen_t }}{{ ' – kalt, Grenze verkürzt' if kalt else '' }}.{%- endif -%}
+                    meldung_aktionen: >-
+                      {{ [
+                        {'action': aktion_fenster_spaeter, 'title': 'Später erinnern (30 min)'},
+                        {'action': aktion_fenster_ignorieren, 'title': 'Ignorieren bis Fenster zu'}
+                      ] if helfer_fenster else [] }}
+                - if:
+                    - "{{ not pausiert and not uebernommen and states(fenster) in weiter_zustaende }}"
+                  then:
+                    - *senden
+                - if:
+                    - "{{ repeat.index <= max_erinnerungen | int }}"
+                  then:
+                    - wait_template: &schleife_ende >-
+                        {{ states(fenster) not in weiter_zustaende
+                           or (helfer_fenster | length > 0
+                               and (state_attr(helfer_fenster, 'timestamp') | float(0))
+                                   > as_timestamp(now()) + 5) }}
+                      timeout:
+                        seconds: "{{ dauer.intervall }}"
+              until:
+                - or:
+                    - "{{ repeat.index > max_erinnerungen | int }}"
+                    - *schleife_ende
+
+      # =======================================================================
+      - alias: Aktion „Später erinnern“ (Feuchte)
+        conditions:
+          - condition: trigger
+            id: aktion_feuchte_spaeter
+        sequence:
+          - if:
+              - "{{ helfer_feuchte | length > 0 }}"
+            then:
+              # Eine laufende Ignorieren-Pause nicht verkürzen
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: "{{ helfer_feuchte }}"
+                data:
+                  timestamp: >-
+                    {{ [as_timestamp(now()) + 1800,
+                        state_attr(helfer_feuchte, 'timestamp') | float(0)] | max }}
+          - variables:
+              loeschen_tag: "{{ tag_feuchte }}"
+          - *loeschen
+          - wait_template: "{{ (states(feuchte_sensor) | float(0)) < ok_wert | float }}"
+            timeout:
+              minutes: 30
+          - if:
+              - "{{ not wait.completed }}"
+            then:
+              # Variablen mit aktuellem Stand neu berechnen
+              - variables:
+                  feuchte: "{{ states(feuchte_sensor) | float(none) }}"
+                  fmt_feuchte: "{{ '%.0f' | format(feuchte) if feuchte is number else '?' }}"
+                  fenster_status: >-
+                    {%- set s = states(fenster) -%}
+                    {{ 'offen' if s == offen_wert else 'gekippt' if s == gekippt_wert
+                       else 'zu' if s == zu_wert else 'unbekannt' }}
+              - if:
+                  - "{{ feuchte is number and feuchte > krit | float }}"
+                  - "{{ fenster_status in ['zu', 'unbekannt'] }}"
+                then:
+                  - *feuchte_meldung
+
+      # =======================================================================
+      - alias: Aktion „Ignorieren bis Feuchte ok“
+        conditions:
+          - condition: trigger
+            id: aktion_feuchte_ignorieren
+          - "{{ helfer_feuchte | length > 0 }}"
+        sequence:
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: "{{ helfer_feuchte }}"
+            data:
+              timestamp: "{{ as_timestamp(now()) + ignorieren_sek }}"
+          - variables:
+              loeschen_tag: "{{ tag_feuchte }}"
+          - *loeschen
+
+      # =======================================================================
+      - alias: Aktion „Später erinnern“ (Fenster)
+        conditions:
+          - condition: trigger
+            id: aktion_fenster_spaeter
+          - "{{ helfer_fenster | length > 0 }}"
+        sequence:
+          # Laufende Schleifen sehen die Pause in ihrem wait_template und enden.
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: "{{ helfer_fenster }}"
+            data:
+              timestamp: "{{ as_timestamp(now()) + 1800 }}"
+          - variables:
+              loeschen_tag: "{{ tag_fenster }}"
+          - *loeschen
+          - wait_template: "{{ states(fenster) not in [offen_wert, gekippt_wert] }}"
+            timeout:
+              minutes: 30
+          - if:
+              - "{{ not wait.completed }}"
+              # Kein "Ignorieren" in der Zwischenzeit
+              - "{{ (state_attr(helfer_fenster, 'timestamp') | float(0)) <= as_timestamp(now()) + 5 }}"
+            then:
+              - variables:
+                  schleife_art: "{{ 'ganz_offen' if states(fenster) == offen_wert else 'nicht_zu' }}"
+                  weiter_zustaende: >-
+                    {{ [offen_wert] if schleife_art == 'ganz_offen' else [offen_wert, gekippt_wert] }}
+                  # Genaue Gesamtdauer ist hier nicht bekannt, also seit dem
+                  # letzten Zustandswechsel ("seit mindestens").
+                  seit_ts: "{{ as_timestamp(states[fenster].last_changed) }}"
+                  seit_genau: false
+              - *fenster_schleife
+
+      # =======================================================================
+      - alias: Aktion „Ignorieren bis Fenster zu“
+        conditions:
+          - condition: trigger
+            id: aktion_fenster_ignorieren
+          - "{{ helfer_fenster | length > 0 }}"
+        sequence:
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: "{{ helfer_fenster }}"
+            data:
+              timestamp: "{{ as_timestamp(now()) + ignorieren_sek }}"
+          - variables:
+              loeschen_tag: "{{ tag_fenster }}"
+          - *loeschen
